@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -41,13 +42,12 @@ type PlaylistItems struct {
 var baseUrl = "https://www.googleapis.com/youtube/v3/playlistItems"
 var part = []string{"snippet", "contentDetails"} // Add more if required
 var playlistId = "PLoILbKo9rG3skRCj37Kn5Zj803hhiuRK6"
-var once sync.Once
 var releaseNotes []*genai.File
 
 func uploadReleaseNotes(ctx context.Context, logger *slog.Logger, client *genai.Client) error {
 	logger.Info("Uploading release notes to Gemini")
 
-	releaseNotesDir := "./releasenotes"
+	releaseNotesDir := "./releasenote"
 	// Walk the release notes directory
 	err := filepath.Walk(releaseNotesDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -77,73 +77,45 @@ func uploadReleaseNotes(ctx context.Context, logger *slog.Logger, client *genai.
 	return nil
 }
 
-func summarizeVideo(ctx context.Context, wg *sync.WaitGroup, logger *slog.Logger, client *genai.Client, limits chan struct{}, results chan<- map[string]string, item VideoItem) error {
+func processVideo(ctx context.Context, wg *sync.WaitGroup, logger *slog.Logger, client *genai.Client, limits chan struct{}, results chan<- map[string]string, item VideoItem) error {
 	defer wg.Done()
 
 	limits <- struct{}{}        // Acquire a limit
 	defer func() { <-limits }() // Release the limit when done
 
-	once.Do(func() {
-		err := uploadReleaseNotes(ctx, logger, client)
-		if err != nil {
-			os.Exit(-1)
-		}
-	})
+	summarizerPrompt := `
+	You are an expert in Go programming.
 
-	prompt := `
-	You're a Principal Go developer and an expert technical content editor.
-
-	Given the above YouTube video URL from a Go programming course recorded with Go version 1.15, and the release notes for Go versions 1.16 to 1.24 (as PDF files), your task is to:
+	You will be given a YouTube video URL of a Go programming course recorded with Go version 1.15.
+	
+	Your task is to summarize the video by following these guidelines:
 	1. Dissect the video content into distinct chapters based on the topics covered.
-
 	2. For each chapter, summarize the key concepts and best practices as concise bullet points:
 		- Include relevant Go code snippets.
 		- Do not include video timestamps or references to specific moments in the video.
-
-	3. Fact check each bullet point in your summary using *only* the content from the release note PDF files.
-
-	4. For any bullet point that is outdated or inaccurate:
-		- Briefly explain what changed.
-		- Cite the specific release note PDF **filename (without extension)** using a numbered format like [1], [2], etc.
-		- Always cite the **first release note file** where the change was introduced.
-		- Do not cite any release note unless it is directly relevant to the concept discussed in the video.
-		- Provide updated code snippets if the original code is outdated.
-
-	5. Return your response in the following strict **Markdown format only**, with no additional text:
+	3. Return your response in the following strict **Markdown format only**, with no additional text:
 	# ` + item.Snippet.Title + `
 
 	## Summary
 	(A brief overview of the video content.)
 
 	## Key Points
-	(A list of chapters with their summaries in bullet points. Include relevant Go code snippets or examples.)
-
-	## What has changed?
-	(Only include changes that affect topics covered in the video. Each point must end with a numbered citation in [#] format. If no relevant changes occurred, state: “No significant changes since the video was recorded.”)
-
-	## Updated Code Examples
-	(Updated Go code from the video content that reflects modern usage. If nothing changed, say: “No updated code examples.”)
-
-	## Citations
-	(A list of **only the release note PDF files that were cited** in the 'What has changed?' section, each preceded by its citation number. For example:  
-	- [1] Go 1.16 Release Notes
-	- [2] Go 1.17 Release Notes
-	If no citations were needed, say: “No citations needed.”)
+	(A list of chapters with their summaries in concise bullet points. Include relevant Go code snippets or examples.)
 	`
+
+	logger.Info("Sending request to Gemini for video summarization", "videoId", item.ContentDetails.VideoId, "title", item.Snippet.Title)
 
 	parts := []*genai.Part{
 		genai.NewPartFromURI(fmt.Sprintf("https://www.youtube.com/watch?v=%s", item.ContentDetails.VideoId), "video/mp4"),
+		genai.NewPartFromText(summarizerPrompt),
 	}
-	for _, file := range releaseNotes {
-		parts = append(parts, genai.NewPartFromURI(file.URI, file.MIMEType))
-	}
-	parts = append(parts, genai.NewPartFromText(prompt))
 
 	contents := []*genai.Content{
 		genai.NewContentFromParts(parts, genai.RoleUser),
 	}
 
 	temperature := float32(0.1)
+	thinkingBudget := int32(-1) // Set to -1 for dynamic thinking
 	response, err := client.Models.GenerateContent(
 		ctx,
 		"gemini-2.5-flash",
@@ -151,18 +123,130 @@ func summarizeVideo(ctx context.Context, wg *sync.WaitGroup, logger *slog.Logger
 		&genai.GenerateContentConfig{
 			Temperature:        &temperature,
 			ResponseModalities: []string{"TEXT"},
+			ThinkingConfig: &genai.ThinkingConfig{
+				ThinkingBudget: &thinkingBudget,
+			},
 		},
 	)
-
 	if err != nil {
-		logger.Error("Failed to generate content using Gemini", "videoId", item.ContentDetails.VideoId, "error", err)
-		return fmt.Errorf("Failed to generate content using Gemini: %w", err)
+		logger.Error("Failed to summarize video using Gemini", "videoId", item.ContentDetails.VideoId, "error", err)
+		return fmt.Errorf("Failed to summarize video using Gemini: %w", err)
 	}
 
-	logger.Info("Received response from Gemini", "videoId", item.ContentDetails.VideoId, "summaryLength", len(response.Text()))
+	logger.Info("Received summarization response from Gemini", "videoId", item.ContentDetails.VideoId, "response", len(response.Text()))
+
+	usageMetadata, err := json.MarshalIndent(response.UsageMetadata, "", "  ")
+	if err != nil {
+		logger.Error("Failed to marshal usage metadata", "videoId", item.ContentDetails.VideoId, "error", err)
+	} else {
+		// Try to unmarshal usageMetadata into a map to access token counts
+		var metaMap map[string]any
+		if err := json.Unmarshal(usageMetadata, &metaMap); err == nil {
+			if thoughts, ok := metaMap["thoughtsTokenCount"]; ok {
+				logger.Info("Thoughts tokens", "count", thoughts)
+			}
+			if candidates, ok := metaMap["candidatesTokenCount"]; ok {
+				logger.Info("Output tokens", "count", candidates)
+			}
+		} else {
+			logger.Info("Usage metadata is not a valid JSON", "usageMetadata", string(usageMetadata))
+		}
+	}
+
+	// Optional: Sleep for a short duration to avoid hitting API rate limits
+	// time.Sleep(1 * time.Minute)
+
+	validatorPrompt := `
+	You are a technical content editor who is an expert in Go programming.
+
+	You will be given the summary and key points in Markdown format derived from a Go programming course recorded with Go version 1.15.
+
+	Your task is to evaluate each key point present under the "Key Points" section of the Markdown using the provided Go release notes PDF files (from versions 1.16 to 1.24) by following these guidelines:
+	1. Determine if every key point is **still valid and accurate** in the latest Go version (1.24) based on the release notes.
+		- **Only** consider the following sections in the release note PDF files while evaluating the key points: "Changes to the language", "Tools" and "Standard library". Ignore any other sections.
+		- Do **not** evaluate key points expressing opinions, philosophies, or general design principles.
+		- Only focus on factual key points about Go syntax, behavior, deprecation, tooling, etc.
+	2. For any key point that is no longer valid or accurate:
+		- Briefly explain what has changed in the latest Go version that affects the key point.
+		- Cite the **first Go version** where the change was introduced using a numbered format like [1], [2], etc.
+		- Do not cite a Go version unless it is directly relevant to the key point. Also, do not cite multiple versions for the same change (choose the most relevant one).
+		- Provide updated code snippets if the original code is outdated.
+	3. Do not use any prior knowledge about Go. Only base your answers on the provided release note PDFs.
+	4. Return your response in the following strict **Markdown format only**, with no additional text:
+	# ` + item.Snippet.Title + `
+
+	## Summary
+	(Summary passed to you as input, do not change it.)
+
+	## Key Points
+	(Key points passed to you as input, do not change them.)
+
+	## What's New
+	(A list of changes found in the key points based on the release notes, with each change cited to the relevant Go version in [x] numbered format.)
+
+	## Updated Code Snippets
+	(If any code snippets in the key points were outdated, provide the updated versions here. If no updated code snippets are needed, omit this section entirely.)
+
+	## Citations
+	(A list of Go version release notes cited in the format [1], [2], etc. For example:
+	- [1] Go version 1.16
+	- [2] Go version 1.17
+	)
+
+	Here are the summary and key points in Markdown format you need to evaluate:
+	` + response.Text()
+
+	parts = []*genai.Part{}
+	for i, file := range releaseNotes {
+		parts = append(parts, genai.NewPartFromText(fmt.Sprintf("[%d] %s", i+1, file.Name)), genai.NewPartFromURI(file.URI, file.MIMEType))
+	}
+	parts = append(parts, genai.NewPartFromText(validatorPrompt))
+
+	contents = []*genai.Content{
+		genai.NewContentFromParts(parts, genai.RoleUser),
+	}
+
+	temperature = float32(0.0)    // Set temperature to 0 for validation
+	thinkingBudget = int32(24576) // Set a high thinking budget for thorough validation
+	response, err = client.Models.GenerateContent(
+		ctx,
+		"gemini-2.5-flash",
+		contents,
+		&genai.GenerateContentConfig{
+			Temperature:        &temperature,
+			ResponseModalities: []string{"TEXT"},
+			ThinkingConfig: &genai.ThinkingConfig{
+				ThinkingBudget: &thinkingBudget,
+			},
+		},
+	)
+	if err != nil {
+		logger.Error("Failed to validate using Gemini", "videoId", item.ContentDetails.VideoId, "error", err)
+		return fmt.Errorf("Failed to validate using Gemini: %w", err)
+	}
+
+	logger.Info("Received validation response from Gemini", "videoId", item.ContentDetails.VideoId, "response", len(response.Text()))
+
+	usageMetadata, err = json.MarshalIndent(response.UsageMetadata, "", "  ")
+	if err != nil {
+		logger.Error("Failed to marshal usage metadata", "videoId", item.ContentDetails.VideoId, "error", err)
+	} else {
+		// Try to unmarshal usageMetadata into a map to access token counts
+		var metaMap map[string]any
+		if err := json.Unmarshal(usageMetadata, &metaMap); err == nil {
+			if thoughts, ok := metaMap["thoughtsTokenCount"]; ok {
+				logger.Info("Thoughts tokens", "count", thoughts)
+			}
+			if candidates, ok := metaMap["candidatesTokenCount"]; ok {
+				logger.Info("Output tokens", "count", candidates)
+			}
+		} else {
+			logger.Info("Usage metadata is not a valid JSON", "usageMetadata", string(usageMetadata))
+		}
+	}
 
 	results <- map[string]string{
-		item.ContentDetails.VideoId: response.Text(),
+		item.Snippet.Title: response.Text(),
 	}
 
 	return nil
@@ -245,16 +329,13 @@ func main() {
 
 	ctx := context.Background()
 
+	// Fetch playlist items from YouTube API
 	playlistItems, err := getPlaylistItems(ctx)
 	if err != nil {
 		logger.Error("Error fetching playlist items", "error", err)
 		os.Exit(-1)
 	}
 	logger.Info("Successfully fetched playlist items", "count", len(playlistItems))
-
-	wg := new(sync.WaitGroup)
-	limits := make(chan struct{}, 5) // Limit to 5 concurrent requests
-	results := make(chan map[string]string, len(playlistItems))
 
 	apiKey, ok := os.LookupEnv("GEMINI_API_KEY")
 	if !ok {
@@ -266,6 +347,7 @@ func main() {
 		os.Exit(-1)
 	}
 
+	// Create a Gemini client
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
 		APIKey:  apiKey,
 		Backend: genai.BackendGeminiAPI,
@@ -275,9 +357,19 @@ func main() {
 		os.Exit(-1)
 	}
 
-	for _, item := range playlistItems[:6] { // Limit to first 6 items for testing
+	// Upload release notes to Gemini
+	if err := uploadReleaseNotes(ctx, logger, client); err != nil {
+		logger.Error("Error uploading release notes to Gemini", "error", err)
+		os.Exit(-1)
+	}
+
+	wg := new(sync.WaitGroup)
+	limits := make(chan struct{}, 5) // Limit to 5 concurrent request to handle Gemini API rate limits
+	results := make(chan map[string]string, len(playlistItems))
+
+	for _, item := range playlistItems {
 		wg.Add(1)
-		go summarizeVideo(ctx, wg, logger, client, limits, results, item)
+		go processVideo(ctx, wg, logger, client, limits, results, item)
 	}
 	wg.Wait()
 	close(results)
@@ -290,11 +382,13 @@ func main() {
 
 	// Collect results
 	for result := range results {
-		for videoId, summary := range result {
-			filePath := filepath.Join("markdown", fmt.Sprintf("%s.md", videoId))
+		for title, summary := range result {
+			re := regexp.MustCompile(`/`) // Replace slashes in titles
+			title = re.ReplaceAllString(title, "_")
+			filePath := filepath.Join("markdown", fmt.Sprintf("%s.md", title))
 			err := os.WriteFile(filePath, []byte(summary), 0644)
 			if err != nil {
-				logger.Error("Error writing summary to file", "videoId", videoId, "error", err)
+				logger.Error("Error writing summary to file", "title", title, "error", err)
 			}
 		}
 	}
